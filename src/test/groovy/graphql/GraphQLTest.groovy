@@ -2,7 +2,9 @@ package graphql
 
 import graphql.analysis.MaxQueryComplexityInstrumentation
 import graphql.analysis.MaxQueryDepthInstrumentation
+import graphql.collect.ImmutableKit
 import graphql.execution.AsyncExecutionStrategy
+import graphql.execution.AsyncSerialExecutionStrategy
 import graphql.execution.DataFetcherExceptionHandler
 import graphql.execution.DataFetcherResult
 import graphql.execution.ExecutionContext
@@ -10,14 +12,17 @@ import graphql.execution.ExecutionId
 import graphql.execution.ExecutionIdProvider
 import graphql.execution.ExecutionStrategyParameters
 import graphql.execution.MissingRootTypeException
-import graphql.execution.batched.BatchedExecutionStrategy
+import graphql.execution.SubscriptionExecutionStrategy
+import graphql.execution.ValueUnboxer
 import graphql.execution.instrumentation.ChainedInstrumentation
 import graphql.execution.instrumentation.Instrumentation
 import graphql.execution.instrumentation.SimpleInstrumentation
 import graphql.execution.instrumentation.dataloader.DataLoaderDispatcherInstrumentation
+import graphql.execution.preparsed.NoOpPreparsedDocumentProvider
 import graphql.language.SourceLocation
 import graphql.schema.DataFetcher
 import graphql.schema.DataFetchingEnvironment
+import graphql.schema.GraphQLDirective
 import graphql.schema.GraphQLEnumType
 import graphql.schema.GraphQLFieldDefinition
 import graphql.schema.GraphQLInterfaceType
@@ -25,6 +30,9 @@ import graphql.schema.GraphQLNonNull
 import graphql.schema.GraphQLObjectType
 import graphql.schema.GraphQLSchema
 import graphql.schema.StaticDataFetcher
+import graphql.schema.idl.SchemaGenerator
+import graphql.schema.idl.errors.SchemaProblem
+import graphql.schema.validation.InvalidSchemaException
 import graphql.validation.ValidationError
 import graphql.validation.ValidationErrorType
 import spock.lang.Specification
@@ -174,6 +182,31 @@ class GraphQLTest extends Specification {
         errors[0].locations == [new SourceLocation(1, 8)]
     }
 
+    def "query with invalid Unicode surrogate in argument - no trailing value"() {
+        given:
+        GraphQLSchema schema = newSchema().query(
+                newObject()
+                        .name("RootQueryType")
+                        .field(newFieldDefinition()
+                                .name("field")
+                                .type(GraphQLString)
+                                .argument(newArgument()
+                                        .name("arg")
+                                        .type(GraphQLNonNull.nonNull(GraphQLString))))
+                        .build()
+        ).build()
+
+        when:
+        // Invalid Unicode character - leading surrogate value without trailing surrogate value
+        def errors = GraphQL.newGraphQL(schema).build().execute('{ hello(arg:"\\ud83c") }').errors
+
+        then:
+        errors.size() == 1
+        errors[0].errorType == ErrorType.InvalidSyntax
+        errors[0].message == "Invalid Syntax : Invalid unicode - leading surrogate must be followed by a trailing surrogate - offending token '\\ud83c' at line 1 column 13"
+        errors[0].locations == [new SourceLocation(1, 13)]
+    }
+
     def "non null argument is missing"() {
         given:
         GraphQLSchema schema = newSchema().query(
@@ -239,7 +272,7 @@ class GraphQLTest extends Specification {
         def expected = [field2: 'value2']
 
         when:
-        def executionInput = newExecutionInput().query(query).operationName('Query2').context(null).variables([:])
+        def executionInput = newExecutionInput().query(query).operationName('Query2').variables([:])
         def result = GraphQL.newGraphQL(schema).build().execute(executionInput)
 
         then:
@@ -786,79 +819,6 @@ class GraphQLTest extends Specification {
         'max query complexity' | new MaxQueryComplexityInstrumentation(10)
     }
 
-
-    def "batched execution with non batched DataFetcher returning CompletableFuture"() {
-        given:
-        GraphQLObjectType foo = newObject()
-                .name("Foo")
-                .withInterface(typeRef("Node"))
-                .field(
-                        { field ->
-                            field
-                                    .name("id")
-                                    .type(Scalars.GraphQLID)
-                        } as UnaryOperator)
-                .build()
-
-        GraphQLInterfaceType node = GraphQLInterfaceType.newInterface()
-                .name("Node")
-                .field(
-                        { field ->
-                            field
-                                    .name("id")
-                                    .type(Scalars.GraphQLID)
-                        } as UnaryOperator)
-                .typeResolver(
-                        {
-                            env ->
-                                if (env.getObject() instanceof CompletableFuture) {
-                                    throw new RuntimeException("This seems bad!")
-                                }
-
-                                return foo
-                        })
-                .build()
-
-        GraphQLObjectType query = newObject()
-                .name("RootQuery")
-                .field(
-                        { field ->
-                            field
-                                    .name("node")
-                                    .dataFetcher(
-                                            { env ->
-                                                CompletableFuture.supplyAsync({ ->
-                                                    Map<String, String> map = new HashMap<>()
-                                                    map.put("id", "abc")
-
-                                                    return map
-                                                })
-                                            })
-                                    .type(node)
-                        } as UnaryOperator)
-                .build()
-
-        GraphQLSchema schema = newSchema()
-                .query(query)
-                .additionalType(foo)
-                .build()
-
-        GraphQL graphQL = GraphQL.newGraphQL(schema)
-                .queryExecutionStrategy(new BatchedExecutionStrategy())
-                .mutationExecutionStrategy(new BatchedExecutionStrategy())
-                .build()
-
-        ExecutionInput executionInput = newExecutionInput()
-                .query("{node {id}}")
-                .build()
-        when:
-        def result = graphQL
-                .execute(executionInput)
-
-        then:
-        result.getData() == [node: [id: "abc"]]
-    }
-
     class CaptureStrategy extends AsyncExecutionStrategy {
         ExecutionId executionId = null
         Instrumentation instrumentation = null
@@ -1212,5 +1172,159 @@ many lines''']
         graphQL.execute("{f}")
         then:
         capturedMsg == "BANG!"
+    }
+
+    def "invalid argument literal"() {
+        def sdl = '''
+            type Query {
+                foo(arg: Input): String
+            }
+            input Input {
+                required: String!
+            }
+        '''
+
+        def schema = TestUtil.schema(sdl)
+        def graphQL = GraphQL.newGraphQL(schema).build()
+        when:
+        def executionResult = graphQL.execute("{foo(arg:{})}")
+        then:
+        executionResult.errors.size() == 1
+        executionResult.errors[0].message.contains("is missing required fields")
+    }
+
+    def "invalid default value for argument via SDL"() {
+        given:
+        def sdl = '''
+            type Query {
+                foo(arg: Input = {}): String
+            }
+            input Input {
+                required: String!
+            }
+        '''
+        when:
+        def schema = TestUtil.schema(sdl)
+        then:
+        def e = thrown(InvalidSchemaException)
+        e.message.contains("Invalid default value")
+    }
+
+    def "invalid default value for argument programmatically"() {
+        given:
+        def arg = newArgument().name("arg").type(GraphQLInt).defaultValueProgrammatic(new LinkedHashMap()).build()
+        def field = newFieldDefinition()
+                .name("hello")
+                .type(GraphQLString)
+                .argument(arg)
+                .build()
+        when:
+        newSchema().query(
+                newObject()
+                        .name("Query")
+                        .field(field)
+                        .build())
+                .build()
+        then:
+        def e = thrown(InvalidSchemaException)
+        e.message.contains("Invalid default value")
+    }
+
+    def "invalid default value for input objects via SDL"() {
+        given:
+        def sdl = '''
+            type Query {
+                foo(arg: Input ={required: null}): String
+            }
+            input Input {
+                required: String!
+            }
+        '''
+        when:
+        def schema = TestUtil.schema(sdl)
+        then:
+        def e = thrown(InvalidSchemaException)
+        e.message.contains("Invalid default value")
+    }
+
+    def "invalid default value for input object programmatically"() {
+        given:
+        def defaultValue = [required: null]
+        def inputObject = newInputObject().name("Input").field(
+                newInputObjectField().name("required").type(GraphQLNonNull.nonNull(GraphQLString)).build())
+                .build()
+        def arg = newArgument().name("arg")
+                .type(inputObject)
+                .defaultValueProgrammatic(defaultValue).build()
+        def field = newFieldDefinition()
+                .name("hello")
+                .type(GraphQLString)
+                .argument(arg)
+                .build()
+        when:
+        newSchema().query(
+                newObject()
+                        .name("Query")
+                        .field(field)
+                        .build())
+                .build()
+        then:
+        def e = thrown(InvalidSchemaException)
+        e.message.contains("Invalid default value")
+    }
+
+    def "Applied schema directives arguments are validated for SDL"() {
+        given:
+        def sdl = '''
+        directive @cached(
+          key: String 
+        ) on FIELD_DEFINITION 
+
+        type Query {
+          hello: String @cached(key: {foo: "bar"}) 
+        }
+        '''
+        when:
+        SchemaGenerator.createdMockedSchema(sdl)
+        then:
+        def e = thrown(SchemaProblem)
+        e.message.contains("an illegal value for the argument ")
+    }
+
+    def "Applied schema directives arguments are validated for programmatic schemas"() {
+        given:
+        def arg = newArgument().name("arg").type(GraphQLInt).valueProgrammatic(ImmutableKit.emptyMap()).build()
+        def directive = GraphQLDirective.newDirective().name("cached").argument(arg).build()
+        def field = newFieldDefinition()
+                .name("hello")
+                .type(GraphQLString)
+                .argument(arg)
+                .withDirective(directive)
+                .build()
+        when:
+        newSchema().query(
+                newObject()
+                        .name("Query")
+                        .field(field)
+                        .build())
+                .build()
+        then:
+        def e = thrown(InvalidSchemaException)
+        e.message.contains("Invalid argument 'arg' for applied directive of name 'cached'")
+    }
+
+    def "getters work as expected"() {
+        Instrumentation instrumentation = new SimpleInstrumentation()
+        when:
+        def graphQL = GraphQL.newGraphQL(StarWarsSchema.starWarsSchema).instrumentation(instrumentation).build()
+        then:
+        graphQL.getGraphQLSchema() == StarWarsSchema.starWarsSchema
+        graphQL.getIdProvider() == ExecutionIdProvider.DEFAULT_EXECUTION_ID_PROVIDER
+        graphQL.getValueUnboxer() == ValueUnboxer.DEFAULT
+        graphQL.getPreparsedDocumentProvider() == NoOpPreparsedDocumentProvider.INSTANCE
+        graphQL.getInstrumentation() instanceof ChainedInstrumentation
+        graphQL.getQueryStrategy() instanceof AsyncExecutionStrategy
+        graphQL.getMutationStrategy() instanceof AsyncSerialExecutionStrategy
+        graphQL.getSubscriptionStrategy() instanceof SubscriptionExecutionStrategy
     }
 }

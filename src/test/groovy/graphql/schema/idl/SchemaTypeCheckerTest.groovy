@@ -8,7 +8,6 @@ import graphql.schema.Coercing
 import graphql.schema.CoercingParseLiteralException
 import graphql.schema.DataFetcher
 import graphql.schema.GraphQLObjectType
-import graphql.schema.GraphQLScalarType
 import graphql.schema.TypeResolver
 import graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError
 import graphql.schema.idl.errors.DirectiveIllegalLocationError
@@ -19,12 +18,12 @@ import graphql.schema.idl.errors.QueryOperationMissingError
 import spock.lang.Specification
 import spock.lang.Unroll
 
+import static graphql.schema.GraphQLScalarType.newScalar
 import static graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError.DUPLICATED_KEYS_MESSAGE
 import static graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError.EXPECTED_ENUM_MESSAGE
 import static graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError.EXPECTED_LIST_MESSAGE
 import static graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError.EXPECTED_NON_NULL_MESSAGE
 import static graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError.EXPECTED_OBJECT_MESSAGE
-import static graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError.EXPECTED_SCALAR_MESSAGE
 import static graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError.MISSING_REQUIRED_FIELD_MESSAGE
 import static graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError.MUST_BE_VALID_ENUM_VALUE_MESSAGE
 import static graphql.schema.idl.errors.DirectiveIllegalArgumentTypeError.NOT_A_VALID_SCALAR_LITERAL_MESSAGE
@@ -33,9 +32,7 @@ import static java.lang.String.format
 
 class SchemaTypeCheckerTest extends Specification {
 
-
-
-    TypeDefinitionRegistry parse(String spec) {
+    static TypeDefinitionRegistry parseSDL(String spec) {
         new SchemaParser().parse(spec)
     }
 
@@ -89,12 +86,12 @@ class SchemaTypeCheckerTest extends Specification {
     }
 
     List<GraphQLError> check(String spec, List<String> resolvingNames) {
-        def types = parse(spec)
+        def types = parseSDL(spec)
 
 
         NamedWiringFactory wiringFactory = new NamedWiringFactory("InterfaceType")
 
-        def scalesScalar = new GraphQLScalarType("Scales", "", new Coercing() {
+        def scalesScalar = newScalar().name("Scales").coercing(new Coercing() {
             @Override
             Object serialize(Object dataFetcherResult) {
                 return null
@@ -110,7 +107,9 @@ class SchemaTypeCheckerTest extends Specification {
                 return null
             }
         })
-        def aCustomDateScalar = new GraphQLScalarType("ACustomDate", "", new Coercing() {
+        .build()
+
+        def aCustomDateScalar = newScalar().name("ACustomDate").coercing(new Coercing() {
             @Override
             Object serialize(Object dataFetcherResult) {
                 return null
@@ -128,7 +127,8 @@ class SchemaTypeCheckerTest extends Specification {
                 }
                 return null
             }
-        })
+        }).build()
+
         def runtimeBuilder = RuntimeWiring.newRuntimeWiring()
                 .wiringFactory(wiringFactory)
                 .scalar(scalesScalar)
@@ -735,6 +735,33 @@ class SchemaTypeCheckerTest extends Specification {
 
         result.isEmpty()
     }
+
+    def "order of interface args does not matter"() {
+        def spec = """
+            interface InterfaceType {
+                fieldA(arg1 : String, arg2 : Int) : String
+            }
+
+            type BaseType {
+                fieldX : Int
+            }
+
+            extend type BaseType implements InterfaceType {
+                fieldA(arg2 : Int, arg1 : String) : String
+            }
+
+            schema {
+              query : BaseType
+            }
+        """
+
+        def result = check(spec)
+
+        expect:
+
+        result.isEmpty()
+    }
+
 
     def "test field arguments on object cannot contain additional required arguments"() {
         def spec = """
@@ -1500,24 +1527,15 @@ class SchemaTypeCheckerTest extends Specification {
         where:
 
         allowedArgType | argValue                                                                               | detailedMessage
-        "String"       | 'MONDAY'                                                                               | format(EXPECTED_SCALAR_MESSAGE, "EnumValue")
-        "String"       | '{ an: "object" }'                                                                     | format(EXPECTED_SCALAR_MESSAGE, "ObjectValue")
-        "String"       | '["str", "str2"]'                                                                      | format(EXPECTED_SCALAR_MESSAGE, "ArrayValue")
         "ACustomDate"  | '"AFailingDate"'                                                                       | format(NOT_A_VALID_SCALAR_LITERAL_MESSAGE, "ACustomDate")
-// Now allowed by #2001
-//        "[String]"     | '"str"'                                                                                | format(EXPECTED_LIST_MESSAGE, "StringValue")
-//        "[String]!"    | '"str"'                                                                                | format(EXPECTED_LIST_MESSAGE, "StringValue")
         "[String!]"    | '["str", null]'                                                                        | format(EXPECTED_NON_NULL_MESSAGE)
         "[[String!]!]" | '[["str"], ["str2", null]]'                                                            | format(EXPECTED_NON_NULL_MESSAGE)
         "WEEKDAY"      | '"somestr"'                                                                            | format(EXPECTED_ENUM_MESSAGE, "StringValue")
         "WEEKDAY"      | 'SATURDAY'                                                                             | format(MUST_BE_VALID_ENUM_VALUE_MESSAGE, "SATURDAY", "MONDAY,TUESDAY")
         "UserInput"    | '{ fieldNonNull: "str", fieldNonNull: "dupeKey" }'                                     | format(DUPLICATED_KEYS_MESSAGE, "fieldNonNull")
         "UserInput"    | '{ fieldNonNull: "str", unknown: "field" }'                                            | format(UNKNOWN_FIELDS_MESSAGE, "unknown", "UserInput")
-// Now allowed by #2001
-//        "UserInput"    | '{ fieldNonNull: "str", fieldArray: "strInsteadOfArray" }'                             | format(EXPECTED_LIST_MESSAGE, "StringValue")
         "UserInput"    | '{ fieldNonNull: "str", fieldArrayOfArray: ["ArrayInsteadOfArrayOfArray"] }'           | format(EXPECTED_LIST_MESSAGE, "StringValue")
         "UserInput"    | '{ fieldNonNull: "str", fieldNestedInput: "strInsteadOfObject" }'                      | format(EXPECTED_OBJECT_MESSAGE, "StringValue")
-        "UserInput"    | '{ fieldNonNull: "str", fieldNestedInput: { street: { s: "objectInsteadOfString" }} }' | format(EXPECTED_SCALAR_MESSAGE, "ObjectValue")
         "UserInput"    | '{ field: "missing the `fieldNonNull` entry"}'                                         | format(MISSING_REQUIRED_FIELD_MESSAGE, "fieldNonNull")
     }
 
